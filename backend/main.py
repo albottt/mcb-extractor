@@ -20,7 +20,7 @@ app = FastAPI(title="MCB Schedule Extractor API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://pdf-extractor-n114mxff3-bot-6d63.vercel.app",
+        "https://mcb-extractor-frontend.onrender.com",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
