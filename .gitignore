@@ -1,0 +1,5 @@
+.dist
+backend/__pycache__/
+backend/.venv/
+frontend/.vercel/
+frontend/node_modules/
