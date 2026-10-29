@@ -1,4 +1,3 @@
-"""FastAPI API for OCR extraction of MCB ratings from load-schedule PDFs."""
 from __future__ import annotations
 
 import base64
@@ -13,7 +12,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from extractor import extract_db_name, extract_page_ratings
+from extractor import extract_db_name, extract_page_ratings, KNOWN_RATINGS, ELCB_RATINGS, ISOLATOR_RATINGS
 
 app = FastAPI(title="MCB Schedule Extractor API", version="1.0.0")
 
@@ -102,63 +101,172 @@ def make_excel(counts_df: pd.DataFrame, review_df: pd.DataFrame) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def extract_pdf_to_result(pdf_bytes: bytes, page_limit: int | None = None, start_page: int = 1) -> dict:
-    """Run the uploaded extractor functions and return the frontend's JSON shape."""
+
+def extract_pdf_to_result(
+    pdf_bytes: bytes,
+    page_limit: int | None = None,
+    start_page: int = 1,
+) -> dict:
+    """Extract MCB and ELCB ratings and combine them in one DB matrix."""
+
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception as exc:
         raise ValueError("The uploaded file is not a readable PDF.") from exc
 
+    board_types = ["MCB", "ELCB", "ISOLATOR"]
+
     with doc:
         total_pdf_pages = len(doc)
+
+        if total_pdf_pages == 0:
+            raise ValueError("The uploaded PDF contains no pages.")
+
         if start_page > total_pdf_pages:
-            raise ValueError(f"start_page ({start_page}) exceeds the PDF's {total_pdf_pages} pages.")
-        end_page = total_pdf_pages if page_limit is None else min(total_pdf_pages, start_page + page_limit - 1)
-        page_counts: dict[int, Counter] = {}
+            raise ValueError(
+                f"start_page ({start_page}) exceeds the PDF's "
+                f"{total_pdf_pages} pages."
+            )
+
+        end_page = (
+            total_pdf_pages
+            if page_limit is None
+            else min(total_pdf_pages, start_page + page_limit - 1)
+        )
+
+        # Store counts separately for every page and rating type.
+        page_counts: dict[tuple[int, str], Counter] = {}
         page_db_names: dict[int, str] = {}
         reviews: list[dict] = []
-        rating_totals: Counter[str] = Counter()
+
+        # Keep all detected ratings for each type.
+        rating_totals = {
+            board_type: Counter()
+            for board_type in board_types
+        }
 
         for page_number in range(start_page, end_page + 1):
             page = doc[page_number - 1]
+
+            # The DB reference is shared by both MCB and ELCB results.
             db_name = extract_db_name(page, page_number)
-            counts, review = extract_page_ratings(page, page_number)
-            page_counts[page_number] = counts
             page_db_names[page_number] = db_name
-            rating_totals.update(counts)
 
-            review["DB name"] = db_name
-            if db_name.startswith("Page "):
-                existing = review.get("Review note", "")
-                review["Review note"] = (existing + "; " if existing else "") + "DB reference not recognized by OCR"
-            if page_number == 1 and not review.get("Review note"):
-                review["Review note"] = "Cover page; verify whether to exclude"
-            if review.get("Review note") or page_number == 1:
-                reviews.append(review)
+            for board_type in board_types:
+                counts, review = extract_page_ratings(
+                    page,
+                    page_number,
+                    board_type,
+                )
 
+                page_counts[(page_number, board_type)] = counts
+                rating_totals[board_type].update(counts)
+
+                # Record the type so MCB and ELCB reviews are distinguishable.
+                review["DB name"] = db_name
+                review["Detected object type"] = board_type
+
+                if db_name.startswith("Page "):
+                    existing = review.get("Review note", "")
+                    warning = "DB reference not recognized by OCR"
+                    review["Review note"] = (
+                        f"{existing}; {warning}"
+                        if existing
+                        else warning
+                    )
+
+                if page_number == 1 and not review.get("Review note"):
+                    review["Review note"] = (
+                        "Cover page; verify whether to exclude"
+                    )
+
+                if review.get("Review note"):
+                    reviews.append(review)
+
+    # Ensure DB reference names are unique across Excel columns.
     db_headers = unique_db_headers(page_db_names)
-    ratings = sorted(rating_totals, key=lambda value: int(value))
-    rating_labels = [f"{rating} A" for rating in ratings]
-    matrix = {
-        db_headers[page_number]: [page_counts[page_number].get(rating, 0) for rating in ratings]
-        for page_number in sorted(page_counts)
+
+    # Build a stable row list: MCB first, ELCB second.
+    # Include configured ratings even when their count is zero.
+    rating_rows: list[tuple[str, str, str]] = []
+
+    for rating in sorted(set(KNOWN_RATINGS), key=int):
+        rating_rows.append((f"{rating} A MCB", "MCB", rating))
+
+    for rating in sorted(set(ELCB_RATINGS), key=int):
+        rating_rows.append((f"{rating} mA ELCB", "ELCB", rating))
+
+    for rating in sorted(set(ISOLATOR_RATINGS), key=int):
+            rating_rows.append((f"{rating} A ISOLATOR", "ISOLATOR", rating))
+
+    # Also include any valid rating detected by OCR that was not
+    # present in the configured rating lists.
+    existing_ratings = {
+        (board_type, rating)
+        for _, board_type, rating in rating_rows
     }
+
+    for board_type in board_types:
+        for rating in rating_totals[board_type]:
+            if (board_type, rating) not in existing_ratings:
+                unit = "A" if board_type == "MCB" else "mA"
+                rating_rows.append(
+                    (f"{rating} {unit} {board_type}", board_type, rating)
+                )
+                existing_ratings.add((board_type, rating))
+
+    # Build the matrix with DB reference numbers as columns.
+    matrix = {}
+
+    for page_number in sorted(page_counts_by_page := {
+        page_num
+        for page_num, _ in page_counts
+    }):
+        db_header = db_headers[page_number]
+        column_values = []
+
+        for _, board_type, rating in rating_rows:
+            counts = page_counts.get(
+                (page_number, board_type),
+                Counter(),
+            )
+            column_values.append(counts.get(rating, 0))
+
+        matrix[db_header] = column_values
+
+    rating_labels = [row_label for row_label, _, _ in rating_rows]
+    row_header = "MCB / ELCB Rating"
+
     counts_df = pd.DataFrame(matrix, index=rating_labels)
-    counts_df.index.name = "MCB Rating"
+    counts_df.index.name = row_header
 
     review_columns = [
-        "PDF page", "DB name", "Detected MCB entries", "Detected ratings",
-        "Average OCR confidence", "Review note",
+        "PDF page",
+        "DB name",
+        "Detected object type",
+        "Detected MCB entries",
+        "Detected ratings",
+        "Average OCR confidence",
+        "Review note",
     ]
+
     review_df = pd.DataFrame(reviews, columns=review_columns)
+
+    # Match the response format expected by the React frontend.
     counts_rows = [
-        {"MCB Rating": rating_label, **{header: int(counts_df.loc[rating_label, header]) for header in counts_df.columns}}
-        for rating_label in rating_labels
+        {
+            row_header: row_label,
+            **{
+                header: int(counts_df.loc[row_label, header])
+                for header in counts_df.columns
+            },
+        }
+        for row_label in rating_labels
     ]
 
     return {
-        "row_header": "MCB Rating",
-        "columns": ["MCB Rating", *list(counts_df.columns)],
+        "row_header": row_header,
+        "columns": [row_header, *list(counts_df.columns)],
         "rows": counts_rows,
         "review_columns": review_columns,
         "review": review_df.fillna("").to_dict(orient="records"),
@@ -168,7 +276,8 @@ def extract_pdf_to_result(pdf_bytes: bytes, page_limit: int | None = None, start
             "processed_pages": end_page - start_page + 1,
             "start_page": start_page,
             "end_page": end_page,
-            "ratings_found": len(rating_labels),
+            "mcb_ratings_found": len(rating_totals["MCB"]),
+            "elcb_ratings_found": len(rating_totals["ELCB"]),
             "db_columns": len(counts_df.columns),
         },
     }

@@ -228,7 +228,7 @@ export default function App() {
         {result && (
           <section className="results-section">
             <div className="section-heading results-heading">
-              <div><h2>Extraction results</h2><p>Counts grouped by MCB rating and DB reference</p></div>
+              <div><h2>Extraction results</h2><p>Counts grouped by board ratings and DB reference</p></div>
               <span className="step-pill">STEP 02</span>
             </div>
 
@@ -255,17 +255,17 @@ export default function App() {
                     {visibleRows.map((row, i) => (
                       <tr key={i}>{result.columns.map((col, j) => <td key={`${col}-${j}`} className={j === 0 ? "sticky-col rating-cell" : "numeric-cell"}>{row[col] ?? 0}</td>)}</tr>
                     ))}
-                    {visibleRows.length === 0 && <tr><td colSpan={result.columns.length} className="empty-cell">No matching MCB ratings.</td></tr>}
+                    {visibleRows.length === 0 && <tr><td colSpan={result.columns.length} className="empty-cell">No matching board ratings.</td></tr>}
                   </tbody>
                 </table>
               </div>
             ) : (
               <div className="table-wrap">
                 <table className="data-table review-table">
-                  <thead><tr>{(result.review_columns || ["PDF page", "DB REF NO", "Detected MCB entries", "Review note"]).map((c) => <th key={c}>{c}</th>)}</tr></thead>
+                  <thead><tr>{(result.review_columns || ["PDF page", "DB REF NO", "Detected Board entries", "Review note"]).map((c) => <th key={c}>{c}</th>)}</tr></thead>
                   <tbody>
                     {(result.review || []).map((row, i) => (
-                      <tr key={i}>{(result.review_columns || ["PDF page", "DB REF NO", "Detected MCB entries", "Review note"]).map((c) => <td key={c}>{row[c] ?? ""}</td>)}</tr>
+                      <tr key={i}>{(result.review_columns || ["PDF page", "DB REF NO", "Detected Board entries", "Review note"]).map((c) => <td key={c}>{row[c] ?? ""}</td>)}</tr>
                     ))}
                     {(!result.review || result.review.length === 0) && <tr><td colSpan={4} className="empty-cell">No review records were returned.</td></tr>}
                   </tbody>

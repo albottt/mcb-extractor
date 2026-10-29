@@ -11,7 +11,7 @@ import pytesseract
 
 PDF_PATH = "Load Schedule.pdf"
 OUTPUT_XLSX = "mcb_counts.xlsx"
-PAGES_TO_PROCESS = 10  # first 386 PDF pages, 1-based
+PAGES_TO_PROCESS = 386  # first 386 PDF pages, 1-based
 DPI = 300
 
 # The schedule starts on PDF page 2 in the uploaded file; page 1 is a cover.
@@ -23,10 +23,18 @@ MCB_X2_FRAC = 0.235
 DATA_Y1_FRAC = 0.230
 DATA_Y2_FRAC = 0.645
 
+ELCB_X1_FRAC = 0.118
+ELCB_X2_FRAC = 0.155
+
+ISOLATOR_X1_FRAC = 0.082
+ISOLATOR_X2_FRAC = 0.117
+
 # Common ratings. Expand this list if your drawings use other ratings.
 KNOWN_RATINGS = ["10", "20", "32", "63" ]
+ELCB_RATINGS = ["30", "100"]
+ISOLATOR_RATINGS = ["40", "63", "80", "100", "125", "160", "200"]
 
-def clean_ocr_token(token):
+def clean_ocr_token(token, objectType):
     """Normalize common OCR confusions in MCB ratings."""
     s = token.upper().replace(" ", "").replace(".", "")
     s = s.replace("O", "0").replace("I", "1").replace("L", "1")
@@ -34,7 +42,11 @@ def clean_ocr_token(token):
     if s.endswith("A"):
         s = s[:-1]
     # Handle OCR variants such as 1OA -> 10A after O->0.
-    if s in KNOWN_RATINGS:
+    if objectType == "MCB" and s in KNOWN_RATINGS:
+        return s
+    if objectType == "ELCB" and s in ELCB_RATINGS:
+        return s
+    if objectType == "Isolator" and s in ISOLATOR_RATINGS:
         return s
     return None
 
@@ -50,7 +62,7 @@ def preprocess_column(gray):
     cleaned = cv2.subtract(binary, horizontal)
     return cv2.bitwise_not(cleaned)
 
-def extract_page_ratings(page, page_number):
+def extract_page_ratings(page, page_number, boardType):
     """OCR the MCB column and return rating counts plus a review record."""
     pix = page.get_pixmap(dpi=DPI, alpha=False)
     image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
@@ -64,6 +76,17 @@ def extract_page_ratings(page, page_number):
     y2 = int(pix.height * DATA_Y2_FRAC)
 
     crop = gray[y1:y2, x1:x2]
+    if boardType == "ELCB":
+        temp_x1 = int(pix.width * ELCB_X1_FRAC)
+        temp_x2 = int(pix.width * ELCB_X2_FRAC)
+        crop = gray[y1:y2, temp_x1:temp_x2]
+
+    if boardType == "Isolator":
+        isolator_x1 = int(pix.width * ISOLATOR_X1_FRAC)
+        isolator_x2 = int(pix.width * ISOLATOR_X2_FRAC)
+        crop = gray[y1:y2, isolator_x1:isolator_x2]
+    # cv2.imwrite(f"isolator_{page_number}.png", gray[y1:y2, isolator_x1:isolator_x2])
+
     crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     cleaned = preprocess_column(crop)
 
@@ -78,7 +101,7 @@ def extract_page_ratings(page, page_number):
         raw = raw.strip()
         if not raw:
             continue
-        rating = clean_ocr_token(raw)
+        rating = clean_ocr_token(raw, boardType)
         if rating:
             conf = float(data["conf"][i]) if data["conf"][i] not in ("", "-1") else -1
             observed.append((rating, conf, data["top"][i], raw))
@@ -122,7 +145,7 @@ def extract_db_name(page, page_number):
         crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )[1]
 
-    # cv2.imwrite(f"page_{page_number}.png", crop)
+    # cv2.imwrite(f"db_{page_number}.png", crop)
     text = pytesseract.image_to_string(crop, config="--oem 3 --psm 6")
     # Match DB reference labels such as DB-E-06-FLS-B-01.
     match = re.search(
@@ -148,81 +171,178 @@ def main():
     pdf_path = Path(PDF_PATH)
     if not pdf_path.exists():
         raise FileNotFoundError(
-            f"Cannot find {PDF_PATH!r}. Put it in the same folder as this script "
-            "or update PDF_PATH."
+            f"Cannot find {PDF_PATH!r}. Put it in the same folder "
+            "as this script or update PDF_PATH."
         )
 
-    rating_totals = Counter()
+    # Process both rating types from every PDF page.
+    board_types = ["MCB", "ELCB", "Isolator"]
+
+    # Store counts separately for each type and PDF page.
     page_counts = {}
     page_db_names = {}
+    rating_totals = {
+        board_type: Counter()
+        for board_type in board_types
+    }
     review_rows = []
 
-    startTime = time.time()
+    start_time = time.time()
+
     with fitz.open(pdf_path) as doc:
         total_pages = min(PAGES_TO_PROCESS, len(doc))
-        print(f"PDF has {len(doc)} pages; processing pages 1–{total_pages}.")
+
+        print(
+            f"PDF has {len(doc)} pages; "
+            f"processing pages 1–{total_pages}."
+        )
 
         for page_index in range(total_pages):
             page_number = page_index + 1
             page = doc[page_index]
 
-            # Cover/intro pages may not contain an MCB schedule; they'll have
-            # zero counts and be flagged for review if no ratings are found.
+            # Extract the DB reference once per page.
             db_name = extract_db_name(page, page_number)
             page_db_names[page_number] = db_name
-            counts, review = extract_page_ratings(page, page_number)
-            review["DB name"] = db_name
-            if db_name.startswith("Page "):
-                review["Review note"] = (review["Review note"] + "; " if review["Review note"] else "") + "DB reference not recognized by OCR"
-            page_counts[page_number] = counts
-            rating_totals.update(counts)
-            if review["Review note"] or page_number == 1:
-                if page_number == 1 and not review["Review note"]:
-                    review["Review note"] = "Cover page; verify whether to exclude"
-                review_rows.append(review)
+
+            # Extract MCB and ELCB ratings independently.
+            for board_type in board_types:
+                counts, review = extract_page_ratings(
+                    page,
+                    page_number,
+                    board_type
+                )
+
+                page_counts[(page_number, board_type)] = counts
+                rating_totals[board_type].update(counts)
+
+                # Identify which type of OCR produced this review record.
+                review["DB name"] = db_name
+                review["Detected object type"] = board_type
+
+                if db_name.startswith("Page "):
+                    existing_note = review["Review note"]
+                    warning = "DB reference not recognized by OCR"
+
+                    review["Review note"] = (
+                        f"{existing_note}; {warning}"
+                        if existing_note
+                        else warning
+                    )
+
+                # Keep records that require attention.
+                if review["Review note"] or page_number == 1:
+                    if page_number == 1 and not review["Review note"]:
+                        review["Review note"] = (
+                            "Cover page; verify whether to exclude"
+                        )
+
+                    review_rows.append(review)
 
             if page_number % 10 == 0 or page_number == total_pages:
-                print(f"Processed {page_number}/{total_pages} pages")
+                print(
+                    f"Processed {page_number}/{total_pages} pages"
+                )
 
-    # Excel column headers should be unique; retain the DB name and append page number for duplicates.
+    # Make DB reference column names unique if duplicates occur.
     used_names = Counter()
     for page_num in sorted(page_db_names):
         name = page_db_names[page_num]
         used_names[name] += 1
+
         if used_names[name] > 1:
-            page_db_names[page_num] = f"{name} (PDF p.{page_num})"
+            page_db_names[page_num] = (
+                f"{name} (PDF p.{page_num})"
+            )
 
-    ratings = sorted(rating_totals, key=lambda x: int(x))
+    # Build the output rating rows.
+    # MCB rows appear first, followed by ELCB rows.
+    rating_rows = []
+
+    for rating in sorted(KNOWN_RATINGS, key=int):
+        rating_rows.append(
+            (f"{rating} A MCB", "MCB", rating)
+        )
+
+    for rating in sorted(ELCB_RATINGS, key=int):
+        rating_rows.append(
+            (f"{rating} mA ELCB", "ELCB", rating)
+        )
+
+    for rating in sorted(ISOLATOR_RATINGS, key=int):
+            rating_rows.append(
+                (f"{rating} A Isolator", "Isolator", rating)
+            )
+
+    # Create the matrix: rating rows × DB reference columns.
+    output_data = {}
+
+    for page_num in range(1, total_pages + 1):
+        db_name = page_db_names[page_num]
+        column_values = []
+
+        for row_label, board_type, rating in rating_rows:
+            counts = page_counts.get(
+                (page_num, board_type),
+                Counter()
+            )
+            column_values.append(counts.get(rating, 0))
+
+        output_data[db_name] = column_values
+
+    row_labels = [row[0] for row in rating_rows]
+
     output = pd.DataFrame(
-        {
-            page_db_names[page_num]: [page_counts[page_num].get(r, 0) for r in ratings]
-            for page_num in range(1, total_pages + 1)
-        },
-        index=[f"{r} A" for r in ratings],
+        output_data,
+        index=row_labels
     )
-    output.index.name = "MCB Rating"
+    output.index.name = "Rating"
 
+    # Export both worksheets.
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
         output.to_excel(writer, sheet_name="Counts")
-        pd.DataFrame(review_rows, columns=[
-            "PDF page", "DB name", "Detected MCB entries", "Detected ratings",
-            "Average OCR confidence", "Review note"
-        ]).to_excel(writer, sheet_name="Review", index=False)
 
-        # Freeze row/column headers and keep ratings visible.
+        review_columns = [
+            "PDF page",
+            "DB name",
+            "Detected object type",
+            "Detected MCB entries",
+            "Detected ratings",
+            "Average OCR confidence",
+            "Review note",
+        ]
+
+        pd.DataFrame(
+            review_rows,
+            columns=review_columns
+        ).to_excel(
+            writer,
+            sheet_name="Review",
+            index=False
+        )
+
+        # Format the Counts worksheet.
         ws = writer.sheets["Counts"]
         ws.freeze_panes = "B2"
-        ws.column_dimensions["A"].width = 18
+        ws.column_dimensions["A"].width = 20
+
         for col in range(2, ws.max_column + 1):
-            ws.column_dimensions[ws.cell(1, col).column_letter].width = 11
+            ws.column_dimensions[
+                ws.cell(1, col).column_letter
+            ].width = 22
+
+        # Format the Review worksheet.
         ws_review = writer.sheets["Review"]
         ws_review.freeze_panes = "A2"
-        ws_review.column_dimensions["C"].width = 65
+        ws_review.column_dimensions["B"].width = 28
+        ws_review.column_dimensions["C"].width = 20
         ws_review.column_dimensions["E"].width = 45
+        ws_review.column_dimensions["G"].width = 45
 
-    print('total time taken: ', time.time() - startTime)
+    print(f"Total time taken: {time.time() - start_time:.2f} seconds")
     print(f"Saved {OUTPUT_XLSX}")
-    print("Review the Review worksheet and verify the MCB crop alignment.")
+    print("Verify MCB, ELCB and Isolator counts in the Counts worksheet.")
+    print("Review the Review worksheet for OCR warnings.")
 
 if __name__ == "__main__":
     main()

@@ -3,3 +3,6 @@ backend/__pycache__/
 backend/.venv/
 frontend/.vercel/
 frontend/node_modules/
+backend/*.pdf
+backend/*.png
+backend/*.xlsx
